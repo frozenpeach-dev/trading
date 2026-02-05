@@ -22,12 +22,14 @@ from typing import Any
 
 import msgspec
 import pandas as pd
+import requests
 
 from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_HTTP_RATE_LIMIT
 from nautilus_trader.adapters.polymarket.common.parsing import parse_polymarket_instrument
+from nautilus_trader.adapters.polymarket.common.symbol import get_polymarket_token_id
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.correctness import PyCondition
-from nautilus_trader.core.datetime import millis_to_nanos
+from nautilus_trader.core.datetime import millis_to_nanos, nanos_to_millis
 from nautilus_trader.model.data import BookOrder
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.data import OrderBookDeltas
@@ -972,3 +974,175 @@ class PolymarketDataLoader:
             trades.append(trade)
 
         return trades
+
+
+
+import os
+class FrozenParquetCache() :
+    def __init__(self, conn_params):
+        self.conn_params = conn_params
+        cache_directory = ".frozen_parquet_cache"
+        if not os.path.exists(cache_directory):
+            os.makedirs(cache_directory)
+
+        self._cache = {}
+        for path in os.listdir(cache_directory):
+            key = path.replace(".parquet", "")
+            self._cache[key] = os.path.join(cache_directory, path)
+    
+    def _get_cache_key(self, instrument, start_time_ms, end_time_ms):
+        return f"{instrument.id}_{start_time_ms}_{end_time_ms}"
+
+    def _get_matching_cache_file(self, instrument, start_time_ms, end_time_ms):
+        token_files = [f for f in self._cache.keys() if f.startswith(f"{instrument.id}_")]
+        for token_file in token_files:
+            _, file_start_str, file_end_str = token_file.split("_")
+            file_start = int(file_start_str)
+            file_end = int(file_end_str)
+            if file_start <= start_time_ms and file_end >= end_time_ms:
+                return self._cache[token_file]
+        return None
+
+    async def _clear_cache(self):
+        cache_directory = ".frozen_parquet_cache"
+        for path in os.listdir(cache_directory):
+            os.remove(os.path.join(cache_directory, path))
+        self._cache = {}  
+
+    def fetch_orderbook_history_db(self, instrument, start_time_ms, end_time_ms):
+        print(start_time_ms, end_time_ms)
+        import io, tqdm
+        if self.conn_params is None:
+            raise ValueError("No QuestDB client provided for FzPolymarketDataLoader")
+
+        QUERY = f"""SELECT ask_sizes, ask_prices, bid_sizes, bid_prices, timestamp, asset
+        FROM book_history
+        WHERE asset = '{get_polymarket_token_id(instrument.id)}'
+        AND timestamp BETWEEN ({start_time_ms} * 1000)::timestamp AND ({end_time_ms} * 1000)::timestamp
+        """
+
+        url = f"http://{self.conn_params['host']}:{self.conn_params.get('port', 9000)}/exp"
+
+        with requests.get(url = url, params={
+            "query" : QUERY,
+            "fmt" : "parquet"
+        }, auth = (self.conn_params['user'], self.conn_params['password']), stream=True) as r:
+            r.raise_for_status()
+
+            total_size = int(r.headers.get('Content-Length', 0))
+            buffer = io.BytesIO()
+
+            with tqdm.tqdm(total=total_size, unit='B', unit_scale=True, desc="Downloading - ") as pbar:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        buffer.write(chunk)
+                        pbar.update(len(chunk))
+
+        df = pd.read_parquet(buffer)
+        return df      
+
+    async def _fetch_and_store(self, instrument, start_time_ms, end_time_ms):
+        df = self.fetch_orderbook_history_db(instrument, start_time_ms, end_time_ms)
+        if df.empty:
+            return df
+        cache_key = self._get_cache_key(instrument, start_time_ms, end_time_ms)
+        cache_directory = ".frozen_parquet_cache"   
+        cache_path = os.path.join(cache_directory, f"{cache_key}.parquet")
+        df.to_parquet(cache_path)
+        self._cache[cache_key] = cache_path
+        return self._crop_dataframe(df, start_time_ms, end_time_ms)
+
+    def _crop_dataframe(self, df, start_time_ms, end_time_ms):
+        start = pd.to_datetime(start_time_ms, unit='ms', utc=True)
+        end = pd.to_datetime(end_time_ms, unit='ms', utc=True)
+        cropped_df = df[(df['timestamp'] >= start) & (df['timestamp'] <= end)]
+        return cropped_df
+    
+    async def get(self, instrument , start_time_ms, end_time_ms):
+        matching_file = self._get_matching_cache_file(instrument, start_time_ms, end_time_ms)
+        if matching_file:
+            print(f"Found matching cache file: {matching_file}")
+            df = pd.read_parquet(matching_file)
+            cropped_df = self._crop_dataframe(df, start_time_ms, end_time_ms)
+            return cropped_df
+        else :
+            start_time_ns = instrument.activation_ns
+            end_time_ns = instrument.expiration_ns
+
+            start_date = pd.to_datetime(start_time_ns, unit='ns', utc=True)
+            end_date = pd.to_datetime(end_time_ns, unit='ns', utc=True)
+            print("No matching cache file found. Fetching from database...")
+            print(f"Fetching data for market start: {start_date}, market end: {end_date}")
+            return await self._fetch_and_store(instrument, end_time_ms=end_time_ns // 10**6, start_time_ms=start_time_ns // 10**6)
+    
+
+class FzPolymarketDataLoader(PolymarketDataLoader):
+    def __init__(self, instrument, token_id = None, http_client = None):
+        super().__init__(instrument, token_id, http_client)
+
+    def set_conn_params(self, conn_params):
+        self._conn_params = conn_params
+        self._cache = FrozenParquetCache(conn_params)
+
+
+    async def load_orderbook_snapshots(self, start, end):
+        print(f"Loading orderbook snapshots for {self.instrument.id} from {start} to {end}")
+        df = await self._cache.get(self.instrument, start.timestamp() * 1000, end.timestamp() * 1000)
+        print("Data loaded, parsing snapshots...")
+        if df.empty:
+            return []
+        
+        all_deltas: list[OrderBookDeltas] = []
+        instrument_id = self._instrument.id
+        make_price = self._instrument.make_price
+        make_qty = self._instrument.make_qty
+
+        for row in df.itertuples():
+            ts_event = millis_to_nanos(int(row.timestamp.value // 10**6))
+
+            deltas = [
+                OrderBookDelta.clear(
+                    instrument_id=instrument_id,
+                    ts_event=ts_event,
+                    ts_init=ts_event,
+                    sequence=0,
+                ),
+            ]
+
+            bid_deltas = [OrderBookDelta(
+                instrument_id=instrument_id,
+                action=BookAction.ADD,
+                order=BookOrder(
+                    side=OrderSide.BUY,
+                    price=make_price(float(bid_price)),
+                    size=make_qty(float(bid_size)),
+                    order_id=0,
+                    ),
+                    flags=0,
+                    sequence=0,
+                    ts_event=ts_event,
+                    ts_init=ts_event,
+                    ) for bid_price, bid_size in zip(row.bid_prices, row.bid_sizes) if float(bid_size) > 0]
+            
+            ask_deltas = [OrderBookDelta(
+                instrument_id=instrument_id,
+                action=BookAction.ADD,
+                order=BookOrder(
+                    side=OrderSide.SELL,
+                    price=make_price(float(ask_price)),
+                    size=make_qty(float(ask_size)),
+                    order_id=0,
+                    ),
+                    flags=0,
+                    sequence=0,
+                    ts_event=ts_event,
+                    ts_init=ts_event,
+                    ) for ask_price, ask_size in zip(row.ask_prices, row.ask_sizes) if float(ask_size) > 0]
+            
+            deltas.extend(bid_deltas)
+            deltas.extend(ask_deltas)
+
+            if deltas:
+                all_deltas.append(OrderBookDeltas(instrument_id=instrument_id, deltas=deltas))
+        
+        return all_deltas

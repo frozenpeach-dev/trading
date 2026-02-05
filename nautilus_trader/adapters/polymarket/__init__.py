@@ -39,7 +39,7 @@ from nautilus_trader.adapters.polymarket.factories import PolymarketLiveDataClie
 from nautilus_trader.adapters.polymarket.factories import PolymarketLiveExecClientFactory
 from nautilus_trader.adapters.polymarket.factories import get_polymarket_http_client
 from nautilus_trader.adapters.polymarket.factories import get_polymarket_instrument_provider
-from nautilus_trader.adapters.polymarket.loaders import PolymarketDataLoader
+from nautilus_trader.adapters.polymarket.loaders import PolymarketDataLoader, FzPolymarketDataLoader
 from nautilus_trader.adapters.polymarket.providers import PolymarketInstrumentProvider
 
 

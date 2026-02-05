@@ -164,12 +164,18 @@ def parse_polymarket_instrument(
     # trades are reported with USDC.e increments though - so we use that here
     size_increment = Quantity.from_str("0.000001")
     end_date_iso = market_info["end_date_iso"]
+    start_date_iso = market_info["accepting_order_timestamp"]
 
     if end_date_iso:
         expiration_ns = pd.Timestamp(end_date_iso).value
     else:
         # end_date_iso can be missing in some conditions that are part of an event that has it
         expiration_ns = (pd.Timestamp.now(tz="UTC") + pd.DateOffset(years=10)).value
+    
+    if start_date_iso:
+        activation_ns = pd.Timestamp(start_date_iso).value
+    else:
+        activation_ns = ts_init if ts_init is not None else time.time_ns()
 
     maker_fee = Decimal(str(market_info["maker_base_fee"]))
     taker_fee = Decimal(str(market_info["taker_base_fee"]))
@@ -187,7 +193,7 @@ def parse_polymarket_instrument(
         price_precision=price_increment.precision,
         size_increment=size_increment,
         size_precision=size_increment.precision,
-        activation_ns=0,  # TBD?
+        activation_ns=activation_ns,  # TBD?
         expiration_ns=expiration_ns,
         max_quantity=None,
         min_quantity=min_quantity,
