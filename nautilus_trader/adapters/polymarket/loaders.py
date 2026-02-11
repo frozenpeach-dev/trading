@@ -22,7 +22,7 @@ from typing import Any
 
 import msgspec
 import pandas as pd
-import requests
+import os
 import clickhouse_connect
 
 from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_HTTP_RATE_LIMIT
