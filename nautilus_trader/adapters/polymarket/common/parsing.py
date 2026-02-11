@@ -177,8 +177,10 @@ def parse_polymarket_instrument(
     else:
         activation_ns = ts_init if ts_init is not None else time.time_ns()
 
-    maker_fee = Decimal(str(market_info["maker_base_fee"]))
-    taker_fee = Decimal(str(market_info["taker_base_fee"]))
+    # maker_fee = Decimal(str(market_info["maker_base_fee"]))
+    # taker_fee = Decimal(str(market_info["taker_base_fee"]))
+    maker_fee = Decimal("0.015")  # Polymarket does not charge maker fees  
+    taker_fee = Decimal("0.015")  # Polymarket does not charge maker fees  
 
     ts_init = ts_init if ts_init is not None else time.time_ns()
 

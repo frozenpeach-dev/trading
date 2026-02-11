@@ -23,6 +23,7 @@ from typing import Any
 import msgspec
 import pandas as pd
 import requests
+import clickhouse_connect
 
 from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_HTTP_RATE_LIMIT
 from nautilus_trader.adapters.polymarket.common.parsing import parse_polymarket_instrument
@@ -975,174 +976,165 @@ class PolymarketDataLoader:
 
         return trades
 
-
-
-import os
-class FrozenParquetCache() :
-    def __init__(self, conn_params):
-        self.conn_params = conn_params
-        cache_directory = ".frozen_parquet_cache"
-        if not os.path.exists(cache_directory):
-            os.makedirs(cache_directory)
-
-        self._cache = {}
-        for path in os.listdir(cache_directory):
-            key = path.replace(".parquet", "")
-            self._cache[key] = os.path.join(cache_directory, path)
-    
-    def _get_cache_key(self, instrument, start_time_ms, end_time_ms):
-        return f"{instrument.id}_{start_time_ms}_{end_time_ms}"
-
-    def _get_matching_cache_file(self, instrument, start_time_ms, end_time_ms):
-        token_files = [f for f in self._cache.keys() if f.startswith(f"{instrument.id}_")]
-        for token_file in token_files:
-            _, file_start_str, file_end_str = token_file.split("_")
-            file_start = int(file_start_str)
-            file_end = int(file_end_str)
-            if file_start <= start_time_ms and file_end >= end_time_ms:
-                return self._cache[token_file]
-        return None
-
-    async def _clear_cache(self):
-        cache_directory = ".frozen_parquet_cache"
-        for path in os.listdir(cache_directory):
-            os.remove(os.path.join(cache_directory, path))
-        self._cache = {}  
-
-    def fetch_orderbook_history_db(self, instrument, start_time_ms, end_time_ms):
-        print(start_time_ms, end_time_ms)
-        import io, tqdm
-        if self.conn_params is None:
-            raise ValueError("No QuestDB client provided for FzPolymarketDataLoader")
-
-        QUERY = f"""SELECT ask_sizes, ask_prices, bid_sizes, bid_prices, timestamp, asset
-        FROM book_history
-        WHERE asset = '{get_polymarket_token_id(instrument.id)}'
-        AND timestamp BETWEEN ({start_time_ms} * 1000)::timestamp AND ({end_time_ms} * 1000)::timestamp
-        """
-
-        url = f"http://{self.conn_params['host']}:{self.conn_params.get('port', 9000)}/exp"
-
-        with requests.get(url = url, params={
-            "query" : QUERY,
-            "fmt" : "parquet"
-        }, auth = (self.conn_params['user'], self.conn_params['password']), stream=True) as r:
-            r.raise_for_status()
-
-            total_size = int(r.headers.get('Content-Length', 0))
-            buffer = io.BytesIO()
-
-            with tqdm.tqdm(total=total_size, unit='B', unit_scale=True, desc="Downloading - ") as pbar:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        buffer.write(chunk)
-                        pbar.update(len(chunk))
-
-        df = pd.read_parquet(buffer)
-        return df      
-
-    async def _fetch_and_store(self, instrument, start_time_ms, end_time_ms):
-        df = self.fetch_orderbook_history_db(instrument, start_time_ms, end_time_ms)
-        if df.empty:
-            return df
-        cache_key = self._get_cache_key(instrument, start_time_ms, end_time_ms)
-        cache_directory = ".frozen_parquet_cache"   
-        cache_path = os.path.join(cache_directory, f"{cache_key}.parquet")
-        df.to_parquet(cache_path)
-        self._cache[cache_key] = cache_path
-        return self._crop_dataframe(df, start_time_ms, end_time_ms)
-
-    def _crop_dataframe(self, df, start_time_ms, end_time_ms):
-        start = pd.to_datetime(start_time_ms, unit='ms', utc=True)
-        end = pd.to_datetime(end_time_ms, unit='ms', utc=True)
-        cropped_df = df[(df['timestamp'] >= start) & (df['timestamp'] <= end)]
-        return cropped_df
-    
-    async def get(self, instrument , start_time_ms, end_time_ms):
-        matching_file = self._get_matching_cache_file(instrument, start_time_ms, end_time_ms)
-        if matching_file:
-            print(f"Found matching cache file: {matching_file}")
-            df = pd.read_parquet(matching_file)
-            cropped_df = self._crop_dataframe(df, start_time_ms, end_time_ms)
-            return cropped_df
-        else :
-            start_time_ns = instrument.activation_ns
-            end_time_ns = instrument.expiration_ns
-
-            start_date = pd.to_datetime(start_time_ns, unit='ns', utc=True)
-            end_date = pd.to_datetime(end_time_ns, unit='ns', utc=True)
-            print("No matching cache file found. Fetching from database...")
-            print(f"Fetching data for market start: {start_date}, market end: {end_date}")
-            return await self._fetch_and_store(instrument, end_time_ms=end_time_ns // 10**6, start_time_ms=start_time_ns // 10**6)
-    
-
 class FzPolymarketDataLoader(PolymarketDataLoader):
     def __init__(self, instrument, token_id = None, http_client = None):
         super().__init__(instrument, token_id, http_client)
+        self.clickhouse_client = clickhouse_connect.get_client(host = os.getenv("CLICKHOUSE_HOST", "localhost"), port = int(os.getenv("CLICKHOUSE_PORT", 8443)), username = os.getenv("CLICKHOUSE_USER", "default"), password = os.getenv("CLICKHOUSE_PASSWORD", ""))
 
-    def set_conn_params(self, conn_params):
-        self._conn_params = conn_params
-        self._cache = FrozenParquetCache(conn_params)
+    def get_asset_price_changes(self, start_time_ms = None, end_time_ms = None):
+        start_time_ms = start_time_ms or (self.instrument.activation_ns // 10**6)
+        end_time_ms = end_time_ms or (self.instrument.expiration_ns // 10**6)
 
+        start_dt = pd.to_datetime(start_time_ms, unit='ms', utc=True)
+        end_dt = pd.to_datetime(end_time_ms, unit='ms', utc=True)
 
-    async def load_orderbook_snapshots(self, start, end):
-        print(f"Loading orderbook snapshots for {self.instrument.id} from {start} to {end}")
-        df = await self._cache.get(self.instrument, start.timestamp() * 1000, end.timestamp() * 1000)
-        print("Data loaded, parsing snapshots...")
-        if df.empty:
-            return []
+        clickhouse_start = start_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        clickhouse_end = end_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+        price_changes = self.clickhouse_client.query_df(f"""
+            SELECT *
+            FROM market_data.price_changes
+            WHERE asset = '{self.token_id}'
+            AND timestamp <= '{clickhouse_end}'
+            AND timestamp >= '{clickhouse_start}'
+        """)
+
+        return price_changes
+
+    def get_asset_price_books(self, start_time_ms = None, end_time_ms = None):
+        start_time_ms = start_time_ms or (self.instrument.activation_ns // 10**6)
+        end_time_ms = end_time_ms or (self.instrument.expiration_ns // 10**6)
+
+        clickhouse_start = pd.to_datetime(start_time_ms, unit='ms', utc=True).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        clickhouse_end = pd.to_datetime(end_time_ms, unit='ms', utc=True).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+        price_books = self.clickhouse_client.query_df(f"""
+            SELECT *
+            FROM                                     
+                market_data.book
+            WHERE asset = '{self.token_id}'
+            AND timestamp <= '{clickhouse_end}'
+            AND timestamp >= '{clickhouse_start}'
+        """)
+        return price_books
+    
+    def load_orderbook_snapshots(self, start, end):
+        price_changes = self.get_asset_price_changes(start, end)
+        price_books = self.get_asset_price_books(start, end)
+
+        print(f"Fetched {len(price_changes)} price changes and {len(price_books)} book updates from ClickHouse")
+
+        price_changes = price_changes.drop_duplicates(subset=['timestamp'], keep='first')
+        price_books = price_books.drop_duplicates(subset=['timestamp'], keep='first')
+        price_changes.sort_values(by='timestamp', inplace=True)
+        price_books.sort_values(by='timestamp', inplace=True)
         
+        ## Merge and create a column to identify the type of data (price change or book update)
+        price_changes['data_type'] = 'price_change'
+        price_books['data_type'] = 'book_update'
+        merged_df = pd.concat([price_changes, price_books], ignore_index=True).sort_values(by=["timestamp", "data_type"], ascending=[True, False])
+
+        self.price_changes = price_changes
+        self.price_books = price_books
+
         all_deltas: list[OrderBookDeltas] = []
-        instrument_id = self._instrument.id
-        make_price = self._instrument.make_price
-        make_qty = self._instrument.make_qty
 
-        for row in df.itertuples():
-            ts_event = millis_to_nanos(int(row.timestamp.value // 10**6))
-
-            deltas = [
-                OrderBookDelta.clear(
-                    instrument_id=instrument_id,
-                    ts_event=ts_event,
-                    ts_init=ts_event,
+        for row in merged_df.itertuples():
+            if row.data_type == 'book_update':
+                # Process book update and create OrderBookDeltas
+                deltas = [ OrderBookDelta.clear(
+                    instrument_id=self._instrument.id,
+                    ts_event=int(row.timestamp.value),
+                    ts_init=int(row.timestamp.value),
                     sequence=0,
-                ),
-            ]
+                ),]
 
-            bid_deltas = [OrderBookDelta(
-                instrument_id=instrument_id,
-                action=BookAction.ADD,
-                order=BookOrder(
-                    side=OrderSide.BUY,
-                    price=make_price(float(bid_price)),
-                    size=make_qty(float(bid_size)),
+                for bid_size, bid_price in zip(row.bid_sizes, row.bid_prices):
+                    if bid_size <= 0:
+                        continue
+
+                    order = BookOrder(
+                        side=OrderSide.BUY,
+                        price=self._instrument.make_price(bid_price),
+                        size=self._instrument.make_qty(bid_size),
+                        order_id=0,
+                    )
+
+                    deltas.append(
+                        OrderBookDelta(
+                            instrument_id=self._instrument.id,
+                            action=BookAction.ADD,
+                            order=order,
+                            flags=0,
+                            sequence=0,
+                            ts_event=int(row.timestamp.value),
+                            ts_init=int(row.timestamp.value),
+                        ),
+                    )
+                for ask_size, ask_price in zip(row.ask_sizes, row.ask_prices):
+                    if ask_size <= 0:
+                        continue
+
+                    order = BookOrder(
+                        side=OrderSide.SELL,
+                        price=self._instrument.make_price(ask_price),
+                        size=self._instrument.make_qty(ask_size),
+                        order_id=0,
+                    )
+
+                    deltas.append(
+                        OrderBookDelta(
+                            instrument_id=self._instrument.id,
+                            action=BookAction.ADD,
+                            order=order,
+                            flags=0,
+                            sequence=0,
+                            ts_event=int(row.timestamp.value),
+                            ts_init=int(row.timestamp.value),
+                        ),
+                    )
+            if row.data_type == 'price_change':
+                price = self._instrument.make_price(row.price)
+                new_size = self._instrument.make_qty(row.new_size)
+                side = OrderSide.SELL if row.side == "SELL" else OrderSide.BUY
+
+                order = BookOrder(
+                    side=side,
+                    price=price,
+                    size=new_size,
                     order_id=0,
-                    ),
-                    flags=0,
-                    sequence=0,
-                    ts_event=ts_event,
-                    ts_init=ts_event,
-                    ) for bid_price, bid_size in zip(row.bid_prices, row.bid_sizes) if float(bid_size) > 0]
-            
-            ask_deltas = [OrderBookDelta(
-                instrument_id=instrument_id,
-                action=BookAction.ADD,
-                order=BookOrder(
-                    side=OrderSide.SELL,
-                    price=make_price(float(ask_price)),
-                    size=make_qty(float(ask_size)),
-                    order_id=0,
-                    ),
-                    flags=0,
-                    sequence=0,
-                    ts_event=ts_event,
-                    ts_init=ts_event,
-                    ) for ask_price, ask_size in zip(row.ask_prices, row.ask_sizes) if float(ask_size) > 0]
-            
-            deltas.extend(bid_deltas)
-            deltas.extend(ask_deltas)
+                )
 
-            if deltas:
-                all_deltas.append(OrderBookDeltas(instrument_id=instrument_id, deltas=deltas))
-        
+                delta = None
+                if new_size == 0 :
+                    delta = OrderBookDelta(
+                        instrument_id=self._instrument.id,
+                        action=BookAction.DELETE,
+                        order=order,
+                        flags=0,
+                        sequence=0,
+                        ts_event=int(row.timestamp.value),
+                        ts_init=int(row.timestamp.value),
+                    )
+                else :
+                    delta = OrderBookDelta(
+                        instrument_id=self._instrument.id,
+                        action=BookAction.UPDATE,
+                        order=order,
+                        flags=0,
+                        sequence=0,
+                        ts_event=int(row.timestamp.value),
+                        ts_init=int(row.timestamp.value),
+                    )
+
+                deltas = [delta]
+            
+            all_deltas.append(OrderBookDeltas(instrument_id=self._instrument.id, deltas=deltas))
+
         return all_deltas
+    
+    def get_price_changes(self):
+        return self.price_changes
+    
+    def get_price_books(self):
+        return self.price_books
