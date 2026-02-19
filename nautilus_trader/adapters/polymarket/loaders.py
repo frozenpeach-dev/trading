@@ -1022,17 +1022,24 @@ class FzPolymarketDataLoader(PolymarketDataLoader):
         price_changes = self.get_asset_price_changes(start, end)
         price_books = self.get_asset_price_books(start, end)
 
+        if price_changes.empty or price_books.empty:
+            print(f"Warning: No data fetched for market {self.token_id}")
+            return
         print(f"Fetched {len(price_changes)} price changes and {len(price_books)} book updates from ClickHouse")
 
-        price_changes = price_changes.drop_duplicates(subset=['timestamp'], keep='first')
-        price_books = price_books.drop_duplicates(subset=['timestamp'], keep='first')
-        price_changes.sort_values(by='timestamp', inplace=True)
-        price_books.sort_values(by='timestamp', inplace=True)
+        # price_changes = price_changes.drop_duplicates(subset=['timestamp'], keep='first')
+        # price_books = price_books.drop_duplicates(subset=['timestamp'], keep='first')
+        price_changes.sort_values(by=['timestamp', 'redis_message_id'], inplace=True)
+        price_books.sort_values(by=['timestamp', 'redis_message_id'], inplace=True)
         
         ## Merge and create a column to identify the type of data (price change or book update)
         price_changes['data_type'] = 'price_change'
         price_books['data_type'] = 'book_update'
-        merged_df = pd.concat([price_changes, price_books], ignore_index=True).sort_values(by=["timestamp", "data_type"], ascending=[True, False])
+        
+        ## We sort by timestamp. For the same timestamp, we sort by redis_message_id to maintain the order of events.
+        ## For the same timestamp and redis_message_id, we process book updates before price changes to ensure 
+        ## the order book is updated before applying price changes.
+        merged_df = pd.concat([price_changes, price_books], ignore_index=True).sort_values(by=["timestamp", 'redis_message_id', 'data_type'], ascending=[True, True, False])
 
         self.price_changes = price_changes
         self.price_books = price_books
